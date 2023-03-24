@@ -140,412 +140,435 @@ inline int64 SafeAdd(int64 v1,int64 v2,int64 f)
 size_t Archive::ReadHeader15()
 {
   RawRead Raw(this);
-
   bool Decrypt=Encrypted && CurBlockPos>(int64)SFXSize+SIZEOF_MARKHEAD3;
+  uint counter = 0;
 
-  if (Decrypt)
+  while (true)
   {
-#ifdef RAR_NOCRYPT // For rarext.dll and unrar_nocrypt.dll.
-    return 0;
-#else
-    RequestArcPassword(NULL);
+    if ((counter++ % 100000) == 0)
+      fprintf(stderr, "Seeking to %lld of %lld (%.2f)\n", CurBlockPos, FileLength(), (static_cast<double>(CurBlockPos) / FileLength()) * 100.f);
+    Seek(CurBlockPos, SEEK_SET);
+    auto startOffset = CurBlockPos;
 
-    byte Salt[SIZE_SALT30];
-    if (Read(Salt,SIZE_SALT30)!=SIZE_SALT30)
+    Raw.Reset();
+
+    if (Decrypt)
     {
+#ifdef RAR_NOCRYPT // For rarext.dll and unrar_nocrypt.dll.
+      return 0;
+#else
+      RequestArcPassword(NULL);
+
+      byte Salt[SIZE_SALT30];
+      if (Read(Salt,SIZE_SALT30)!=SIZE_SALT30)
+      {
+        UnexpEndArcMsg();
+        return 0;
+      }
+      HeadersCrypt.SetCryptKeys(false,CRYPT_RAR30,&Cmd->Password,Salt,NULL,0,NULL,NULL);
+      Raw.SetCrypt(&HeadersCrypt);
+#endif
+    }
+
+    Raw.Read(SIZEOF_SHORTBLOCKHEAD);
+    if (Raw.Size()==0)
+    {
+      fprintf(stderr, "End of Arc while reading short block head\n");
+      //CurBlockPos = NextBlockPos = startOffset + 1;
+      //continue;
       UnexpEndArcMsg();
       return 0;
     }
-    HeadersCrypt.SetCryptKeys(false,CRYPT_RAR30,&Cmd->Password,Salt,NULL,0,NULL,NULL);
-    Raw.SetCrypt(&HeadersCrypt);
-#endif
-  }
 
-  Raw.Read(SIZEOF_SHORTBLOCKHEAD);
-  if (Raw.Size()==0)
-  {
-    UnexpEndArcMsg();
-    return 0;
-  }
+    ShortBlock.HeadCRC=Raw.Get2();
 
-  ShortBlock.HeadCRC=Raw.Get2();
+    ShortBlock.Reset();
 
-  ShortBlock.Reset();
+    uint HeaderType=Raw.Get1();
+    ShortBlock.Flags=Raw.Get2();
+    ShortBlock.SkipIfUnknown=(ShortBlock.Flags & SKIP_IF_UNKNOWN)!=0;
+    ShortBlock.HeadSize=Raw.Get2();
 
-  uint HeaderType=Raw.Get1();
-  ShortBlock.Flags=Raw.Get2();
-  ShortBlock.SkipIfUnknown=(ShortBlock.Flags & SKIP_IF_UNKNOWN)!=0;
-  ShortBlock.HeadSize=Raw.Get2();
-
-  ShortBlock.HeaderType=(HEADER_TYPE)HeaderType;
-  if (ShortBlock.HeadSize<SIZEOF_SHORTBLOCKHEAD)
-  {
-    BrokenHeaderMsg();
-    return 0;
-  }
-
-  // For simpler further processing we map header types common
-  // for RAR 1.5 and 5.0 formats to RAR 5.0 values. It does not include
-  // header types specific for RAR 1.5 - 4.x only.
-  switch(ShortBlock.HeaderType)
-  {
-    case HEAD3_MAIN:    ShortBlock.HeaderType=HEAD_MAIN;     break;
-    case HEAD3_FILE:    ShortBlock.HeaderType=HEAD_FILE;     break;
-    case HEAD3_SERVICE: ShortBlock.HeaderType=HEAD_SERVICE;  break;
-    case HEAD3_ENDARC:  ShortBlock.HeaderType=HEAD_ENDARC;   break;
-  }
-  CurHeaderType=ShortBlock.HeaderType;
-
-  if (ShortBlock.HeaderType==HEAD3_CMT)
-  {
-    // Old style (up to RAR 2.9) comment header embedded into main
-    // or file header. We must not read the entire ShortBlock.HeadSize here
-    // to not break the comment processing logic later.
-    Raw.Read(SIZEOF_COMMHEAD-SIZEOF_SHORTBLOCKHEAD);
-  }
-  else
-    if (ShortBlock.HeaderType==HEAD_MAIN && (ShortBlock.Flags & MHD_COMMENT)!=0)
+    ShortBlock.HeaderType=(HEADER_TYPE)HeaderType;
+    if (ShortBlock.HeadSize<SIZEOF_SHORTBLOCKHEAD || (HeaderType == HEAD3_SIGN || HeaderType == HEAD3_AV || HeaderType < 0x72 || HeaderType > 0x7b || ShortBlock.HeadCRC == 0))
     {
-      // Old style (up to RAR 2.9) main archive comment embedded into
-      // the main archive header found. While we can read the entire
-      // ShortBlock.HeadSize here and remove this part of "if", it would be
-      // waste of memory, because we'll read and process this comment data
-      // in other function anyway and we do not need them here now.
-      Raw.Read(SIZEOF_MAINHEAD3-SIZEOF_SHORTBLOCKHEAD);
+      //BrokenHeaderMsg();
+      //fprintf(stderr, "Broken header\n");
+      NextBlockPos = CurBlockPos = startOffset + 1;
+      continue;
+      //return 0;
+    }
+
+    // For simpler further processing we map header types common
+    // for RAR 1.5 and 5.0 formats to RAR 5.0 values. It does not include
+    // header types specific for RAR 1.5 - 4.x only.
+    switch(ShortBlock.HeaderType)
+    {
+      case HEAD3_MAIN:    ShortBlock.HeaderType=HEAD_MAIN;     break;
+      case HEAD3_FILE:    ShortBlock.HeaderType=HEAD_FILE;     break;
+      case HEAD3_SERVICE: ShortBlock.HeaderType=HEAD_SERVICE;  break;
+      case HEAD3_ENDARC:  ShortBlock.HeaderType=HEAD_ENDARC;   break;
+    }
+    CurHeaderType=ShortBlock.HeaderType;
+
+    if (ShortBlock.HeaderType==HEAD3_CMT)
+    {
+      // Old style (up to RAR 2.9) comment header embedded into main
+      // or file header. We must not read the entire ShortBlock.HeadSize here
+      // to not break the comment processing logic later.
+      Raw.Read(SIZEOF_COMMHEAD-SIZEOF_SHORTBLOCKHEAD);
     }
     else
-      Raw.Read(ShortBlock.HeadSize-SIZEOF_SHORTBLOCKHEAD);
-
-  NextBlockPos=CurBlockPos+FullHeaderSize(ShortBlock.HeadSize);
-
-  switch(ShortBlock.HeaderType)
-  {
-    case HEAD_MAIN:
-      MainHead.Reset();
-      *(BaseBlock *)&MainHead=ShortBlock;
-      MainHead.HighPosAV=Raw.Get2();
-      MainHead.PosAV=Raw.Get4();
-
-      Volume=(MainHead.Flags & MHD_VOLUME)!=0;
-      Solid=(MainHead.Flags & MHD_SOLID)!=0;
-      Locked=(MainHead.Flags & MHD_LOCK)!=0;
-      Protected=(MainHead.Flags & MHD_PROTECT)!=0;
-      Encrypted=(MainHead.Flags & MHD_PASSWORD)!=0;
-      Signed=MainHead.PosAV!=0 || MainHead.HighPosAV!=0;
-      MainHead.CommentInHeader=(MainHead.Flags & MHD_COMMENT)!=0;
-
-      // Only for encrypted 3.0+ archives. 2.x archives did not have this
-      // flag, so for non-encrypted archives, we'll set it later based on
-      // file attributes.
-      FirstVolume=(MainHead.Flags & MHD_FIRSTVOLUME)!=0;
-
-      NewNumbering=(MainHead.Flags & MHD_NEWNUMBERING)!=0;
-      break;
-    case HEAD_FILE:
-    case HEAD_SERVICE:
+      if (ShortBlock.HeaderType==HEAD_MAIN && (ShortBlock.Flags & MHD_COMMENT)!=0)
       {
-        bool FileBlock=ShortBlock.HeaderType==HEAD_FILE;
-        FileHeader *hd=FileBlock ? &FileHead:&SubHead;
-        hd->Reset();
+        // Old style (up to RAR 2.9) main archive comment embedded into
+        // the main archive header found. While we can read the entire
+        // ShortBlock.HeadSize here and remove this part of "if", it would be
+        // waste of memory, because we'll read and process this comment data
+        // in other function anyway and we do not need them here now.
+        Raw.Read(SIZEOF_MAINHEAD3-SIZEOF_SHORTBLOCKHEAD);
+      }
+      else
+        Raw.Read(ShortBlock.HeadSize-SIZEOF_SHORTBLOCKHEAD);
 
-        *(BaseBlock *)hd=ShortBlock;
+    NextBlockPos=CurBlockPos+FullHeaderSize(ShortBlock.HeadSize);
 
-        hd->SplitBefore=(hd->Flags & LHD_SPLIT_BEFORE)!=0;
-        hd->SplitAfter=(hd->Flags & LHD_SPLIT_AFTER)!=0;
-        hd->Encrypted=(hd->Flags & LHD_PASSWORD)!=0;
-        hd->SaltSet=(hd->Flags & LHD_SALT)!=0;
-        hd->Solid=FileBlock && (hd->Flags & LHD_SOLID)!=0;
-        hd->SubBlock=!FileBlock && (hd->Flags & LHD_SOLID)!=0;
-        hd->Dir=(hd->Flags & LHD_WINDOWMASK)==LHD_DIRECTORY;
-        hd->WinSize=hd->Dir ? 0:0x10000<<((hd->Flags & LHD_WINDOWMASK)>>5);
-        hd->CommentInHeader=(hd->Flags & LHD_COMMENT)!=0;
-        hd->Version=(hd->Flags & LHD_VERSION)!=0;
+    switch(ShortBlock.HeaderType)
+    {
+      case HEAD_MAIN:
+        MainHead.Reset();
+        *(BaseBlock *)&MainHead=ShortBlock;
+        MainHead.HighPosAV=Raw.Get2();
+        MainHead.PosAV=Raw.Get4();
 
-        hd->DataSize=Raw.Get4();
-        uint LowUnpSize=Raw.Get4();
-        hd->HostOS=Raw.Get1();
+        Volume=(MainHead.Flags & MHD_VOLUME)!=0;
+        Solid=(MainHead.Flags & MHD_SOLID)!=0;
+        Locked=(MainHead.Flags & MHD_LOCK)!=0;
+        Protected=(MainHead.Flags & MHD_PROTECT)!=0;
+        Encrypted=(MainHead.Flags & MHD_PASSWORD)!=0;
+        Signed=MainHead.PosAV!=0 || MainHead.HighPosAV!=0;
+        MainHead.CommentInHeader=(MainHead.Flags & MHD_COMMENT)!=0;
 
-        hd->FileHash.Type=HASH_CRC32;
-        hd->FileHash.CRC32=Raw.Get4();
+        // Only for encrypted 3.0+ archives. 2.x archives did not have this
+        // flag, so for non-encrypted archives, we'll set it later based on
+        // file attributes.
+        FirstVolume=(MainHead.Flags & MHD_FIRSTVOLUME)!=0;
 
-        uint FileTime=Raw.Get4();
-        hd->UnpVer=Raw.Get1();
+        NewNumbering=(MainHead.Flags & MHD_NEWNUMBERING)!=0;
+        break;
+      case HEAD_FILE:
+      case HEAD_SERVICE:
+        {
+          bool FileBlock=ShortBlock.HeaderType==HEAD_FILE;
+          FileHeader *hd=FileBlock ? &FileHead:&SubHead;
+          hd->Reset();
 
-        hd->Method=Raw.Get1()-0x30;
-        size_t NameSize=Raw.Get2();
-        hd->FileAttr=Raw.Get4();
+          *(BaseBlock *)hd=ShortBlock;
 
-        // RAR15 did not use the special dictionary size to mark dirs.
-        if (hd->UnpVer<20 && (hd->FileAttr & 0x10)!=0)
-          hd->Dir=true;
+          hd->SplitBefore=(hd->Flags & LHD_SPLIT_BEFORE)!=0;
+          hd->SplitAfter=(hd->Flags & LHD_SPLIT_AFTER)!=0;
+          hd->Encrypted=(hd->Flags & LHD_PASSWORD)!=0;
+          hd->SaltSet=(hd->Flags & LHD_SALT)!=0;
+          hd->Solid=FileBlock && (hd->Flags & LHD_SOLID)!=0;
+          hd->SubBlock=!FileBlock && (hd->Flags & LHD_SOLID)!=0;
+          hd->Dir=(hd->Flags & LHD_WINDOWMASK)==LHD_DIRECTORY;
+          hd->WinSize=hd->Dir ? 0:0x10000<<((hd->Flags & LHD_WINDOWMASK)>>5);
+          hd->CommentInHeader=(hd->Flags & LHD_COMMENT)!=0;
+          hd->Version=(hd->Flags & LHD_VERSION)!=0;
 
-        hd->CryptMethod=CRYPT_NONE;
-        if (hd->Encrypted)
-          switch(hd->UnpVer)
+          hd->DataSize=Raw.Get4();
+          uint LowUnpSize=Raw.Get4();
+          hd->HostOS=Raw.Get1();
+
+          hd->FileHash.Type=HASH_CRC32;
+          hd->FileHash.CRC32=Raw.Get4();
+
+          uint FileTime=Raw.Get4();
+          hd->UnpVer=Raw.Get1();
+
+          hd->Method=Raw.Get1()-0x30;
+          size_t NameSize=Raw.Get2();
+          hd->FileAttr=Raw.Get4();
+
+          // RAR15 did not use the special dictionary size to mark dirs.
+          if (hd->UnpVer<20 && (hd->FileAttr & 0x10)!=0)
+            hd->Dir=true;
+
+          hd->CryptMethod=CRYPT_NONE;
+          if (hd->Encrypted)
+            switch(hd->UnpVer)
+            {
+              case 13: hd->CryptMethod=CRYPT_RAR13; break;
+              case 15: hd->CryptMethod=CRYPT_RAR15; break;
+              case 20:
+              case 26: hd->CryptMethod=CRYPT_RAR20; break;
+              default: hd->CryptMethod=CRYPT_RAR30; break;
+            }
+
+          hd->HSType=HSYS_UNKNOWN;
+          if (hd->HostOS==HOST_UNIX || hd->HostOS==HOST_BEOS)
+            hd->HSType=HSYS_UNIX;
+          else
+            if (hd->HostOS<HOST_MAX)
+              hd->HSType=HSYS_WINDOWS;
+
+          hd->RedirType=FSREDIR_NONE;
+
+          // RAR 4.x Unix symlink.
+          if (hd->HostOS==HOST_UNIX && (hd->FileAttr & 0xF000)==0xA000)
           {
-            case 13: hd->CryptMethod=CRYPT_RAR13; break;
-            case 15: hd->CryptMethod=CRYPT_RAR15; break;
-            case 20:
-            case 26: hd->CryptMethod=CRYPT_RAR20; break;
-            default: hd->CryptMethod=CRYPT_RAR30; break;
+            hd->RedirType=FSREDIR_UNIXSYMLINK;
+            *hd->RedirName=0;
           }
 
-        hd->HSType=HSYS_UNKNOWN;
-        if (hd->HostOS==HOST_UNIX || hd->HostOS==HOST_BEOS)
-          hd->HSType=HSYS_UNIX;
-        else
-          if (hd->HostOS<HOST_MAX)
-            hd->HSType=HSYS_WINDOWS;
+          hd->Inherited=!FileBlock && (hd->SubFlags & SUBHEAD_FLAGS_INHERITED)!=0;
 
-        hd->RedirType=FSREDIR_NONE;
+          hd->LargeFile=(hd->Flags & LHD_LARGE)!=0;
 
-        // RAR 4.x Unix symlink.
-        if (hd->HostOS==HOST_UNIX && (hd->FileAttr & 0xF000)==0xA000)
-        {
-          hd->RedirType=FSREDIR_UNIXSYMLINK;
-          *hd->RedirName=0;
-        }
-
-        hd->Inherited=!FileBlock && (hd->SubFlags & SUBHEAD_FLAGS_INHERITED)!=0;
-
-        hd->LargeFile=(hd->Flags & LHD_LARGE)!=0;
-
-        uint HighPackSize,HighUnpSize;
-        if (hd->LargeFile)
-        {
-          HighPackSize=Raw.Get4();
-          HighUnpSize=Raw.Get4();
-          hd->UnknownUnpSize=(LowUnpSize==0xffffffff && HighUnpSize==0xffffffff);
-        }
-        else
-        {
-          HighPackSize=HighUnpSize=0;
-          // UnpSize equal to 0xffffffff without LHD_LARGE flag indicates
-          // that we do not know the unpacked file size and must unpack it
-          // until we find the end of file marker in compressed data.
-          hd->UnknownUnpSize=(LowUnpSize==0xffffffff);
-        }
-        hd->PackSize=INT32TO64(HighPackSize,hd->DataSize);
-        hd->UnpSize=INT32TO64(HighUnpSize,LowUnpSize);
-        if (hd->UnknownUnpSize)
-          hd->UnpSize=INT64NDF;
-
-        char FileName[NM*4];
-        size_t ReadNameSize=Min(NameSize,ASIZE(FileName)-1);
-        Raw.GetB((byte *)FileName,ReadNameSize);
-        FileName[ReadNameSize]=0;
-
-        if (FileBlock)
-        {
-          *hd->FileName=0;
-          if ((hd->Flags & LHD_UNICODE)!=0)
+          uint HighPackSize,HighUnpSize;
+          if (hd->LargeFile)
           {
-            EncodeFileName NameCoder;
-            size_t Length=strlen(FileName);
-            Length++;
-            if (ReadNameSize>Length)
-              NameCoder.Decode(FileName,ReadNameSize,(byte *)FileName+Length,
-                               ReadNameSize-Length,hd->FileName,
-                               ASIZE(hd->FileName));
+            HighPackSize=Raw.Get4();
+            HighUnpSize=Raw.Get4();
+            hd->UnknownUnpSize=(LowUnpSize==0xffffffff && HighUnpSize==0xffffffff);
           }
+          else
+          {
+            HighPackSize=HighUnpSize=0;
+            // UnpSize equal to 0xffffffff without LHD_LARGE flag indicates
+            // that we do not know the unpacked file size and must unpack it
+            // until we find the end of file marker in compressed data.
+            hd->UnknownUnpSize=(LowUnpSize==0xffffffff);
+          }
+          hd->PackSize=INT32TO64(HighPackSize,hd->DataSize);
+          hd->UnpSize=INT32TO64(HighUnpSize,LowUnpSize);
+          if (hd->UnknownUnpSize)
+            hd->UnpSize=INT64NDF;
 
-          if (*hd->FileName==0)
-            ArcCharToWide(FileName,hd->FileName,ASIZE(hd->FileName),ACTW_OEM);
+          char FileName[NM*4];
+          size_t ReadNameSize=Min(NameSize,ASIZE(FileName)-1);
+          Raw.GetB((byte *)FileName,ReadNameSize);
+          FileName[ReadNameSize]=0;
+
+          if (FileBlock)
+          {
+            *hd->FileName=0;
+            if ((hd->Flags & LHD_UNICODE)!=0)
+            {
+              EncodeFileName NameCoder;
+              size_t Length=strlen(FileName);
+              Length++;
+              if (ReadNameSize>Length)
+                NameCoder.Decode(FileName,ReadNameSize,(byte *)FileName+Length,
+                                 ReadNameSize-Length,hd->FileName,
+                                 ASIZE(hd->FileName));
+            }
+
+            if (*hd->FileName==0)
+              ArcCharToWide(FileName,hd->FileName,ASIZE(hd->FileName),ACTW_OEM);
 
 #ifndef SFX_MODULE
-          ConvertNameCase(hd->FileName);
+            ConvertNameCase(hd->FileName);
 #endif
-          ConvertFileHeader(hd);
-        }
-        else
-        {
-          CharToWide(FileName,hd->FileName,ASIZE(hd->FileName));
+            ConvertFileHeader(hd);
+          }
+          else
+          {
+            CharToWide(FileName,hd->FileName,ASIZE(hd->FileName));
 
-          // Calculate the size of optional data.
-          int DataSize=int(hd->HeadSize-NameSize-SIZEOF_FILEHEAD3);
+            // Calculate the size of optional data.
+            int DataSize=int(hd->HeadSize-NameSize-SIZEOF_FILEHEAD3);
+            if ((hd->Flags & LHD_SALT)!=0)
+              DataSize-=SIZE_SALT30;
+
+            if (DataSize>0)
+            {
+              // Here we read optional additional fields for subheaders.
+              // They are stored after the file name and before salt.
+              hd->SubData.Alloc(DataSize);
+              Raw.GetB(&hd->SubData[0],DataSize);
+
+            }
+
+            if (hd->CmpName(SUBHEAD_TYPE_CMT))
+              MainComment=true;
+          }
           if ((hd->Flags & LHD_SALT)!=0)
-            DataSize-=SIZE_SALT30;
-
-          if (DataSize>0)
+            Raw.GetB(hd->Salt,SIZE_SALT30);
+          hd->mtime.SetDos(FileTime);
+          if ((hd->Flags & LHD_EXTTIME)!=0)
           {
-            // Here we read optional additional fields for subheaders.
-            // They are stored after the file name and before salt.
-            hd->SubData.Alloc(DataSize);
-            Raw.GetB(&hd->SubData[0],DataSize);
-
+            ushort Flags=Raw.Get2();
+            RarTime *tbl[4];
+            tbl[0]=&FileHead.mtime;
+            tbl[1]=&FileHead.ctime;
+            tbl[2]=&FileHead.atime;
+            tbl[3]=NULL; // Archive time is not used now.
+            for (int I=0;I<4;I++)
+            {
+              RarTime *CurTime=tbl[I];
+              uint rmode=Flags>>(3-I)*4;
+              if ((rmode & 8)==0 || CurTime==NULL)
+                continue;
+              if (I!=0)
+              {
+                uint DosTime=Raw.Get4();
+                CurTime->SetDos(DosTime);
+              }
+              RarLocalTime rlt;
+              CurTime->GetLocal(&rlt);
+              if (rmode & 4)
+                rlt.Second++;
+              rlt.Reminder=0;
+              uint count=rmode&3;
+              for (uint J=0;J<count;J++)
+              {
+                byte CurByte=Raw.Get1();
+                rlt.Reminder|=(((uint)CurByte)<<((J+3-count)*8));
+              }
+              // Convert from 100ns RAR precision to REMINDER_PRECISION.
+              rlt.Reminder*=RarTime::REMINDER_PRECISION/10000000;
+              CurTime->SetLocal(&rlt);
+            }
           }
+          // Set to 0 in case of overflow, so end of ReadHeader cares about it.
+          NextBlockPos=SafeAdd(NextBlockPos,hd->PackSize,0);
 
-          if (hd->CmpName(SUBHEAD_TYPE_CMT))
-            MainComment=true;
-        }
-        if ((hd->Flags & LHD_SALT)!=0)
-          Raw.GetB(hd->Salt,SIZE_SALT30);
-        hd->mtime.SetDos(FileTime);
-        if ((hd->Flags & LHD_EXTTIME)!=0)
-        {
-          ushort Flags=Raw.Get2();
-          RarTime *tbl[4];
-          tbl[0]=&FileHead.mtime;
-          tbl[1]=&FileHead.ctime;
-          tbl[2]=&FileHead.atime;
-          tbl[3]=NULL; // Archive time is not used now.
-          for (int I=0;I<4;I++)
+          bool CRCProcessedOnly=hd->CommentInHeader;
+          ushort HeaderCRC=Raw.GetCRC15(CRCProcessedOnly);
+          if (hd->HeadCRC!=HeaderCRC)
           {
-            RarTime *CurTime=tbl[I];
-            uint rmode=Flags>>(3-I)*4;
-            if ((rmode & 8)==0 || CurTime==NULL)
-              continue;
-            if (I!=0)
-            {
-              uint DosTime=Raw.Get4();
-              CurTime->SetDos(DosTime);
-            }
-            RarLocalTime rlt;
-            CurTime->GetLocal(&rlt);
-            if (rmode & 4)
-              rlt.Second++;
-            rlt.Reminder=0;
-            uint count=rmode&3;
-            for (uint J=0;J<count;J++)
-            {
-              byte CurByte=Raw.Get1();
-              rlt.Reminder|=(((uint)CurByte)<<((J+3-count)*8));
-            }
-            // Convert from 100ns RAR precision to REMINDER_PRECISION.
-            rlt.Reminder*=RarTime::REMINDER_PRECISION/10000000;
-            CurTime->SetLocal(&rlt);
+            //BrokenHeader=true;
+            //ErrHandler.SetErrorCode(RARX_WARNING);
+
+            // If we have a broken encrypted header, we do not need to display
+            // the error message here, because it will be displayed for such
+            // headers later in this function. Also such headers are unlikely
+            // to have anything sensible in file name field, so it is useless
+            // to display the file name.
+            //if (!Decrypt)
+              //uiMsg(UIERROR_FHEADERBROKEN,Archive::FileName,hd->FileName);
+            CurBlockPos = NextBlockPos = startOffset + 1;
+            continue;
           }
         }
-        // Set to 0 in case of overflow, so end of ReadHeader cares about it.
-        NextBlockPos=SafeAdd(NextBlockPos,hd->PackSize,0);
-
-        bool CRCProcessedOnly=hd->CommentInHeader;
-        ushort HeaderCRC=Raw.GetCRC15(CRCProcessedOnly);
-        if (hd->HeadCRC!=HeaderCRC)
-        {
-          BrokenHeader=true;
-          ErrHandler.SetErrorCode(RARX_WARNING);
-
-          // If we have a broken encrypted header, we do not need to display
-          // the error message here, because it will be displayed for such
-          // headers later in this function. Also such headers are unlikely
-          // to have anything sensible in file name field, so it is useless
-          // to display the file name.
-          if (!Decrypt)
-            uiMsg(UIERROR_FHEADERBROKEN,Archive::FileName,hd->FileName);
-        }
-      }
-      break;
-    case HEAD_ENDARC:
-      *(BaseBlock *)&EndArcHead=ShortBlock;
-      EndArcHead.NextVolume=(EndArcHead.Flags & EARC_NEXT_VOLUME)!=0;
-      EndArcHead.DataCRC=(EndArcHead.Flags & EARC_DATACRC)!=0;
-      EndArcHead.RevSpace=(EndArcHead.Flags & EARC_REVSPACE)!=0;
-      EndArcHead.StoreVolNumber=(EndArcHead.Flags & EARC_VOLNUMBER)!=0;
-      if (EndArcHead.DataCRC)
-        EndArcHead.ArcDataCRC=Raw.Get4();
-      if (EndArcHead.StoreVolNumber)
-        VolNumber=EndArcHead.VolNumber=Raw.Get2();
-      break;
+        break;
+      case HEAD_ENDARC:
+        *(BaseBlock *)&EndArcHead=ShortBlock;
+        EndArcHead.NextVolume=(EndArcHead.Flags & EARC_NEXT_VOLUME)!=0;
+        EndArcHead.DataCRC=(EndArcHead.Flags & EARC_DATACRC)!=0;
+        EndArcHead.RevSpace=(EndArcHead.Flags & EARC_REVSPACE)!=0;
+        EndArcHead.StoreVolNumber=(EndArcHead.Flags & EARC_VOLNUMBER)!=0;
+        if (EndArcHead.DataCRC)
+          EndArcHead.ArcDataCRC=Raw.Get4();
+        if (EndArcHead.StoreVolNumber)
+          VolNumber=EndArcHead.VolNumber=Raw.Get2();
+        break;
 #ifndef SFX_MODULE
-    case HEAD3_CMT:
-      *(BaseBlock *)&CommHead=ShortBlock;
-      CommHead.UnpSize=Raw.Get2();
-      CommHead.UnpVer=Raw.Get1();
-      CommHead.Method=Raw.Get1();
-      CommHead.CommCRC=Raw.Get2();
-      break;
-    case HEAD3_PROTECT:
-      *(BaseBlock *)&ProtectHead=ShortBlock;
-      ProtectHead.DataSize=Raw.Get4();
-      ProtectHead.Version=Raw.Get1();
-      ProtectHead.RecSectors=Raw.Get2();
-      ProtectHead.TotalBlocks=Raw.Get4();
-      Raw.GetB(ProtectHead.Mark,8);
-      NextBlockPos+=ProtectHead.DataSize;
-      break;
-    case HEAD3_OLDSERVICE: // RAR 2.9 and earlier.
-      *(BaseBlock *)&SubBlockHead=ShortBlock;
-      SubBlockHead.DataSize=Raw.Get4();
-      NextBlockPos+=SubBlockHead.DataSize;
-      SubBlockHead.SubType=Raw.Get2();
-      SubBlockHead.Level=Raw.Get1();
-      switch(SubBlockHead.SubType)
-      {
-        case UO_HEAD:
-          *(SubBlockHeader *)&UOHead=SubBlockHead;
-          UOHead.OwnerNameSize=Raw.Get2();
-          UOHead.GroupNameSize=Raw.Get2();
-          if (UOHead.OwnerNameSize>=ASIZE(UOHead.OwnerName))
-            UOHead.OwnerNameSize=ASIZE(UOHead.OwnerName)-1;
-          if (UOHead.GroupNameSize>=ASIZE(UOHead.GroupName))
-            UOHead.GroupNameSize=ASIZE(UOHead.GroupName)-1;
-          Raw.GetB(UOHead.OwnerName,UOHead.OwnerNameSize);
-          Raw.GetB(UOHead.GroupName,UOHead.GroupNameSize);
-          UOHead.OwnerName[UOHead.OwnerNameSize]=0;
-          UOHead.GroupName[UOHead.GroupNameSize]=0;
-          break;
-        case NTACL_HEAD:
-          *(SubBlockHeader *)&EAHead=SubBlockHead;
-          EAHead.UnpSize=Raw.Get4();
-          EAHead.UnpVer=Raw.Get1();
-          EAHead.Method=Raw.Get1();
-          EAHead.EACRC=Raw.Get4();
-          break;
-        case STREAM_HEAD:
-          *(SubBlockHeader *)&StreamHead=SubBlockHead;
-          StreamHead.UnpSize=Raw.Get4();
-          StreamHead.UnpVer=Raw.Get1();
-          StreamHead.Method=Raw.Get1();
-          StreamHead.StreamCRC=Raw.Get4();
-          StreamHead.StreamNameSize=Raw.Get2();
-          if (StreamHead.StreamNameSize>=ASIZE(StreamHead.StreamName))
-            StreamHead.StreamNameSize=ASIZE(StreamHead.StreamName)-1;
-          Raw.GetB(StreamHead.StreamName,StreamHead.StreamNameSize);
-          StreamHead.StreamName[StreamHead.StreamNameSize]=0;
-          break;
-      }
-      break;
+      case HEAD3_CMT:
+        *(BaseBlock *)&CommHead=ShortBlock;
+        CommHead.UnpSize=Raw.Get2();
+        CommHead.UnpVer=Raw.Get1();
+        CommHead.Method=Raw.Get1();
+        CommHead.CommCRC=Raw.Get2();
+        break;
+      case HEAD3_PROTECT:
+        *(BaseBlock *)&ProtectHead=ShortBlock;
+        ProtectHead.DataSize=Raw.Get4();
+        ProtectHead.Version=Raw.Get1();
+        ProtectHead.RecSectors=Raw.Get2();
+        ProtectHead.TotalBlocks=Raw.Get4();
+        Raw.GetB(ProtectHead.Mark,8);
+        NextBlockPos+=ProtectHead.DataSize;
+        break;
+      case HEAD3_OLDSERVICE: // RAR 2.9 and earlier.
+        *(BaseBlock *)&SubBlockHead=ShortBlock;
+        SubBlockHead.DataSize=Raw.Get4();
+        NextBlockPos+=SubBlockHead.DataSize;
+        SubBlockHead.SubType=Raw.Get2();
+        SubBlockHead.Level=Raw.Get1();
+        switch(SubBlockHead.SubType)
+        {
+          case UO_HEAD:
+            *(SubBlockHeader *)&UOHead=SubBlockHead;
+            UOHead.OwnerNameSize=Raw.Get2();
+            UOHead.GroupNameSize=Raw.Get2();
+            if (UOHead.OwnerNameSize>=ASIZE(UOHead.OwnerName))
+              UOHead.OwnerNameSize=ASIZE(UOHead.OwnerName)-1;
+            if (UOHead.GroupNameSize>=ASIZE(UOHead.GroupName))
+              UOHead.GroupNameSize=ASIZE(UOHead.GroupName)-1;
+            Raw.GetB(UOHead.OwnerName,UOHead.OwnerNameSize);
+            Raw.GetB(UOHead.GroupName,UOHead.GroupNameSize);
+            UOHead.OwnerName[UOHead.OwnerNameSize]=0;
+            UOHead.GroupName[UOHead.GroupNameSize]=0;
+            break;
+          case NTACL_HEAD:
+            *(SubBlockHeader *)&EAHead=SubBlockHead;
+            EAHead.UnpSize=Raw.Get4();
+            EAHead.UnpVer=Raw.Get1();
+            EAHead.Method=Raw.Get1();
+            EAHead.EACRC=Raw.Get4();
+            break;
+          case STREAM_HEAD:
+            *(SubBlockHeader *)&StreamHead=SubBlockHead;
+            StreamHead.UnpSize=Raw.Get4();
+            StreamHead.UnpVer=Raw.Get1();
+            StreamHead.Method=Raw.Get1();
+            StreamHead.StreamCRC=Raw.Get4();
+            StreamHead.StreamNameSize=Raw.Get2();
+            if (StreamHead.StreamNameSize>=ASIZE(StreamHead.StreamName))
+              StreamHead.StreamNameSize=ASIZE(StreamHead.StreamName)-1;
+            Raw.GetB(StreamHead.StreamName,StreamHead.StreamNameSize);
+            StreamHead.StreamName[StreamHead.StreamNameSize]=0;
+            break;
+        }
+        break;
 #endif
-    default:
-      if (ShortBlock.Flags & LONG_BLOCK)
-        NextBlockPos+=Raw.Get4();
-      break;
-  }
-
-  ushort HeaderCRC=Raw.GetCRC15(false);
-
-  // Old AV header does not have header CRC properly set.
-  if (ShortBlock.HeadCRC!=HeaderCRC && ShortBlock.HeaderType!=HEAD3_SIGN &&
-      ShortBlock.HeaderType!=HEAD3_AV)
-  {
-    bool Recovered=false;
-    if (ShortBlock.HeaderType==HEAD_ENDARC && EndArcHead.RevSpace)
-    {
-      // Last 7 bytes of recovered volume can contain zeroes, because
-      // REV files store its own information (volume number, etc.) here.
-      int64 Length=Tell();
-      Seek(Length-7,SEEK_SET);
-      Recovered=true;
-      for (int J=0;J<7;J++)
-        if (GetByte()!=0)
-          Recovered=false;
+      default:
+        if (ShortBlock.Flags & LONG_BLOCK)
+          NextBlockPos+=Raw.Get4();
+        break;
     }
-    if (!Recovered)
-    {
-      BrokenHeader=true;
-      ErrHandler.SetErrorCode(RARX_CRC);
 
-      if (Decrypt)
+    ushort HeaderCRC=Raw.GetCRC15(false);
+
+    // Old AV header does not have header CRC properly set.
+    if (ShortBlock.HeadCRC!=HeaderCRC && ShortBlock.HeaderType!=HEAD3_SIGN &&
+        ShortBlock.HeaderType!=HEAD3_AV)
+    {
+      bool Recovered=false;
+      if (ShortBlock.HeaderType==HEAD_ENDARC && EndArcHead.RevSpace)
       {
-        uiMsg(UIERROR_CHECKSUMENC,FileName,FileName);
-        FailedHeaderDecryption=true;
-        return 0;
+        // Last 7 bytes of recovered volume can contain zeroes, because
+        // REV files store its own information (volume number, etc.) here.
+        int64 Length=Tell();
+        Seek(Length-7,SEEK_SET);
+        Recovered=true;
+        for (int J=0;J<7;J++)
+          if (GetByte()!=0)
+            Recovered=false;
+      }
+      if (!Recovered)
+      {
+        //fprintf(stderr, "Header CRC does not match\n");
+        CurBlockPos = NextBlockPos = startOffset + 1;
+        Encrypted = Decrypt;
+        continue;
+        //BrokenHeader=true;
+        //ErrHandler.SetErrorCode(RARX_CRC);
+
+        if (Decrypt)
+        {
+          uiMsg(UIERROR_CHECKSUMENC,FileName,FileName);
+          FailedHeaderDecryption=true;
+          return 0;
+        }
       }
     }
-  }
 
-  return Raw.Size();
+    fprintf(stderr, "Got 0x%x header, size %zu, head CRC %d\n", ShortBlock.HeaderType, Raw.Size(), ShortBlock.HeadCRC);
+    return Raw.Size();
+  }
 }
 
 
